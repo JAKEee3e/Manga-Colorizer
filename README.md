@@ -3,7 +3,11 @@
 
 
 !pip install Flask-Cors einops
+
 !pip install Flask-Cors
+
 !pip install einops
+
 !pip install --upgrade pip
+
 !pip install opencv-python-headless
