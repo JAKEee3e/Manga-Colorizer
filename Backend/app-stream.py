@@ -1,0 +1,518 @@
+import argparse
+import base64
+import io
+import json
+import random
+import time
+import urllib.error
+import urllib.request
+import os
+import gc
+import sys
+
+import torch
+import PIL.Image
+import numpy as np
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
+
+# Ensure the Backend directory is in the Python path
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
+from denoisator import MangaDenoiser
+from colorizator import MangaColorizator
+from upscalator import MangaUpscaler
+from utils.utils import distance_from_grayscale, generate_random_id, \
+    image_to_base64, load_image_as_base64, save_image, sanitize_string, clear_torch_cache
+
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+DEFAULT_MODEL_PATHS = {
+    # Colorizers
+    'AlacGAN': 'networks/generator.zip',
+    'CycleGAN': 'networks/latest_net_G_A.pth',
+
+    # Upscalers
+    'ESRGAN': 'networks/RealESRGAN_x4plus_anime_6B.pt',
+    'GigaGAN': 'networks/GigaGAN.ckpt'
+}
+
+def resolve_paths(config):
+    if config.colorizer_path is None:
+        config.colorizer_path = DEFAULT_MODEL_PATHS.get(config.colorizer_type)
+        print(f"[*] Defaulting colorizer path to: {config.colorizer_path}")
+
+    if config.upscaler_path is None:
+        config.upscaler_path = DEFAULT_MODEL_PATHS.get(config.upscaler_type)
+        print(f"[*] Defaulting upscaler path to: {config.upscaler_path}")
+
+class ModelSettings:
+    pass
+
+@app.route('/')
+def index():
+    return 'Manga Colorizer is Up and Running!'
+
+
+@app.route('/colorize-image-data', methods=['POST'])
+def colorize_image_data():
+    rid = generate_random_id()
+
+    try:
+        req_json = request.get_json()
+        img_name = req_json.get('imgName', f'Image-{rid}')
+        img_url = req_json.get('imgURL', '')
+        img_data = req_json.get('imgData')
+        img_width = req_json.get('imgWidth', -1)
+        img_height = req_json.get('imgHeight', -1)
+        colorize = req_json.get('colorize', config.colorize)
+        upscale = req_json.get('upscale', config.upscale)
+        denoise = req_json.get('denoise', config.denoise)
+        denoise_sigma = req_json.get('denoiseSigma', config.denoise_sigma)
+        upscale_factor = req_json.get('upscaleFactor', config.upscale_factor)
+        cache = req_json.get('cache', False)
+        manga_title = req_json.get('mangaTitle', '')
+        manga_chapter = req_json.get('mangaChapter', '')
+
+        if denoise_sigma < 0:
+            print(f'[-] [{rid}] Denoiser sigma ({denoise_sigma}) cannot be negative, using default')
+            denoise_sigma = config.denoise_sigma
+
+        if upscale_factor not in [2, 4]:
+            print(f'[-] [{rid}] Upscale factor ({upscale_factor}) must be 2 or 4, using default')
+            upscale_factor = config.upscale_factor
+
+        check_model_availability(rid, colorize, config.colorize, 'colorize')
+        check_model_availability(rid, upscale, config.upscale, 'upscale')
+        check_model_availability(rid, denoise, config.denoise, 'denoise')
+
+        if manga_title and manga_chapter:
+            print(f'[+] [{rid}] Detected manga: {manga_title} >> {manga_chapter}')
+            if cache and not rid in img_name:
+                cached_image = load_from_cache(manga_title, manga_chapter, img_name)
+                if cached_image:
+                    print(f'[+] [{rid}] Retrieving cached image')
+                    return jsonify({'colorImgData': cached_image})
+
+        print(f'[+] [{rid}] Requested image: {img_name}, Width: {img_width}, Height: {img_height}')
+        print(f'[+] [{rid}] Colorize: {colorize}, Upscale: {upscale}{f"(x{upscale_factor})" if upscale else ""}, Denoise: {denoise}')
+
+        if img_data:
+            img_metadata, img_data64 = img_data.split(',', 1)
+            orig_image_binary = base64.decodebytes(bytes(img_data64, encoding='utf-8'))
+        elif img_url:  # Could not find imgData, look for imgURL instead
+            orig_image_binary = retrieve_image_binary(rid, request, img_url)
+        else:
+            msg = 'Neither imgData nor imgURL found in the request'
+            print(f'[-] [{rid}] {msg}')
+            return jsonify({'msg': f'Image: {img_name}, Error: {msg}'})
+
+        imgio = io.BytesIO(orig_image_binary)
+        image = PIL.Image.open(imgio)
+        image = np.array(image)
+        
+        # Resize if max_image_size is set (faster processing)
+        max_size = config.max_image_size
+        if max_size > 0:
+            h, w = image.shape[:2]
+            if max(h, w) > max_size:
+                ratio = max_size / max(h, w)
+                new_w, new_h = int(w * ratio), int(h * ratio)
+                image = np.array(PIL.Image.fromarray(image).resize((new_w, new_h), PIL.Image.LANCZOS))
+                print(f'[*] [{rid}] Resized from {w}x{h} to {new_w}x{new_h} for faster processing')
+
+        if not img_data:
+            coloredness = distance_from_grayscale(image)
+            print(f'[+] [{rid}] Image distance from grayscale: {coloredness}')
+            if coloredness > 1:
+                print(f'[+] [{rid}] Image already colored: {coloredness}')
+                return jsonify({'msg': f'Image: {img_name}, Already colored: {coloredness} > 1'})
+
+        if denoise:
+            print(f'[*] [{rid}] Denoising image...')
+            image = denoise_image(rid, image, denoiser, denoise_sigma)
+
+        if colorize:
+            print(f'[*] [{rid}] Colorizing image...')
+            image = colorize_image(rid, image, colorizer)
+
+        if upscale:
+            print(f'[*] [{rid}] Upscaling image...')
+            image = upscale_image(rid, image, upscaler, upscale_factor)
+
+        if cache:
+            try:
+                if manga_title and manga_chapter and rid not in img_name:
+                    save_to_cache(manga_title, manga_chapter, img_name, image)
+                    print(f'[+] [{rid}] Imaged cached')
+                else:
+                    print(f'[-] [{rid}] Caching enabled, but manga details could not be detected, skipping')
+            except Exception as te:
+                print(f'[-] [{rid}] Error while cacheing: {te}')
+
+        result_image_data64 = image_to_base64(image)
+        return jsonify({'colorImgData': result_image_data64})
+
+    except RuntimeError as e:
+        print(f'[!] [{rid}] Error: {e}')
+        handle_cuda_error(e)
+
+    response = jsonify({'msg': f'Image: {img_name}, Error: Unable to colorize'})
+    return response
+
+
+@app.route('/colorize-batch', methods=['POST'])
+def colorize_batch():
+    """Process multiple images automatically when available"""
+    try:
+        req_json = request.get_json()
+        images = req_json.get('images', [])  # List of image objects
+        batch_id = generate_random_id()
+        
+        if not images:
+            return jsonify({'error': 'No images provided'}), 400
+        
+        # Determine recommended batch size based on GPU
+        max_recommended = 50  # Default safe limit
+        if config.device == 'cuda' and torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            if 'a100' in gpu_name:
+                max_recommended = 200 if gpu_memory >= 80 else 100  # A100 can handle many
+            elif gpu_memory >= 24:
+                max_recommended = 100
+            elif gpu_memory >= 16:
+                max_recommended = 50
+            else:
+                max_recommended = 20
+        
+        if len(images) > max_recommended:
+            print(f'[!] [BATCH-{batch_id}] Warning: {len(images)} images exceeds recommended limit of {max_recommended}. Processing anyway...')
+        
+        print(f'[+] [BATCH-{batch_id}] Processing {len(images)} images (recommended max: {max_recommended})')
+        
+        results = []
+        for idx, img_obj in enumerate(images):
+            try:
+                # Extract image data from the batch item
+                img_name = img_obj.get('imgName', f'Batch-{batch_id}-{idx}')
+                img_data = img_obj.get('imgData')
+                img_url = img_obj.get('imgURL', '')
+                img_width = img_obj.get('imgWidth', -1)
+                img_height = img_obj.get('imgHeight', -1)
+                colorize = img_obj.get('colorize', config.colorize)
+                upscale = img_obj.get('upscale', config.upscale)
+                denoise = img_obj.get('denoise', config.denoise)
+                denoise_sigma = img_obj.get('denoiseSigma', config.denoise_sigma)
+                upscale_factor = img_obj.get('upscaleFactor', config.upscale_factor)
+                cache = img_obj.get('cache', False)
+                manga_title = img_obj.get('mangaTitle', '')
+                manga_chapter = img_obj.get('mangaChapter', '')
+                
+                rid = f"{batch_id}-{idx}"
+                
+                # Create a request-like object for compatibility with existing functions
+                class BatchRequest:
+                    def __init__(self, img_data, img_url):
+                        self.img_data = img_data
+                        self.img_url = img_url
+                
+                # Process each image using existing logic
+                if img_data:
+                    img_metadata, img_data64 = img_data.split(',', 1)
+                    orig_image_binary = base64.decodebytes(bytes(img_data64, encoding='utf-8'))
+                elif img_url:
+                    orig_image_binary = retrieve_image_binary(rid, BatchRequest(img_data, img_url), img_url)
+                else:
+                    results.append({'imgName': img_name, 'error': 'No image data or URL provided'})
+                    continue
+                
+                imgio = io.BytesIO(orig_image_binary)
+                image = PIL.Image.open(imgio)
+                image = np.array(image)
+                
+                # Resize if needed
+                max_size = config.max_image_size
+                if max_size > 0:
+                    h, w = image.shape[:2]
+                    if max(h, w) > max_size:
+                        ratio = max_size / max(h, w)
+                        new_w, new_h = int(w * ratio), int(h * ratio)
+                        image = np.array(PIL.Image.fromarray(image).resize((new_w, new_h), PIL.Image.LANCZOS))
+                
+                # Process the image
+                if denoise:
+                    image = denoise_image(rid, image, denoiser, denoise_sigma)
+                
+                if colorize:
+                    image = colorize_image(rid, image, colorizer)
+                
+                if upscale:
+                    image = upscale_image(rid, image, upscaler, upscale_factor)
+                
+                # Cache if requested
+                if cache and manga_title and manga_chapter:
+                    try:
+                        save_to_cache(manga_title, manga_chapter, img_name, image)
+                    except Exception as te:
+                        print(f'[-] [{rid}] Error while caching: {te}')
+                
+                result_image_data64 = image_to_base64(image)
+                results.append({
+                    'imgName': img_name,
+                    'colorImgData': result_image_data64,
+                    'status': 'success'
+                })
+                
+                print(f'[+] [BATCH-{batch_id}] Completed {idx+1}/{len(images)}: {img_name}')
+                
+            except Exception as e:
+                print(f'[!] [BATCH-{batch_id}] Error processing image {idx}: {e}')
+                results.append({
+                    'imgName': img_obj.get('imgName', f'Image-{idx}'),
+                    'error': str(e),
+                    'status': 'failed'
+                })
+        
+        print(f'[+] [BATCH-{batch_id}] Batch processing complete: {sum(1 for r in results if r.get("status") == "success")}/{len(results)} successful')
+        return jsonify({'batchId': batch_id, 'results': results, 'total': len(results)})
+        
+    except Exception as e:
+        print(f'[!] Batch processing error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+def handle_cuda_error(e):
+    global colorizer, upscaler, denoiser
+
+    if 'CUDA error: an illegal memory access was encountered' \
+        in str(e) or 'CUDA out of memory' in str(e) or \
+        'CUDA error: misaligned address' in str(e):
+        print(f'[-] CUDA Error encountered, reinitializing...')
+        colorizer = None
+        upscaler = None
+        denoiser = None
+        clear_torch_cache()
+        gc.collect()
+        initialize_components()
+
+def get_cache_filename(manga_title, manga_chapter, image_name):
+    chapter_dir = get_cache_dir(manga_title, manga_chapter)
+    filename = f"{sanitize_string(image_name.strip())}.webp"
+    return os.path.join(chapter_dir, filename)
+
+def get_cache_dir(manga_title, manga_chapter):
+    cache_root = getattr(config, 'cache_root', 'cache') if config else 'cache'
+    if not cache_root:
+        cache_root = 'cache'
+    title_dir = os.path.join(cache_root.strip().replace(' ', '_'), sanitize_string(manga_title.strip()))
+    chapter_dir = os.path.join(title_dir, sanitize_string(manga_chapter.strip()))
+    return chapter_dir
+
+def save_to_cache(manga_title, manga_chapter, image_name, image):
+    cache_filename = get_cache_filename(manga_title, manga_chapter, image_name)
+    os.makedirs(os.path.dirname(cache_filename), exist_ok=True)
+    save_image(image, cache_filename)
+
+def load_from_cache(manga_title, manga_chapter, image_name):
+    cache_filename = get_cache_filename(manga_title, manga_chapter, image_name)
+    if os.path.exists(cache_filename):
+        return load_image_as_base64(cache_filename)
+    return None
+
+def check_model_availability(rid, requested, available, name):
+    if requested and not available:
+        print(f'[-] [{rid}] Requested {name}, but model is not initialized, please run the server without --no-{name}')
+
+
+def retrieve_image_binary(rid, original_request, url):
+    user_agent = original_request.headers.get('User-Agent', '')
+    referer = request.referrer if request.referrer else ''
+    origin = request.origin if request.origin else ''
+
+    referer = referer if referer else origin
+    origin = origin if origin else referer
+
+    headers = {
+        'User-Agent': user_agent,
+        'Referer': referer,
+        'Origin': origin,
+        'Accept': 'image/png;q=1.0,image/jpg;q=0.9,image/webp;q=0.7,image/*;q=0.5',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'identity'
+    }
+
+    print(f'[*] Retrieving image from url={url}')
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        return urllib.request.urlopen(req).read()
+    except urllib.error.URLError as e:
+        print(f'[!] [{rid}] URLError: {e.reason}')
+        abort(500)
+    except os.error as ex:
+        print(f'[!] [{rid}] Retrieve error: {ex}')
+    return False
+
+
+def denoise_image(rid, image, denoiser, sigma):
+    start_time = time.time()
+    denoised_image = denoiser.denoise(image, sigma)
+    elapsed_time = time.time() - start_time
+    print(f'[+] [{rid}] Denoised image {[*image.shape]}->{[*denoised_image.shape]} in {elapsed_time:.2f} seconds.')
+    return denoised_image
+
+
+def colorize_image(rid, image, colorizer, size=0):
+    start_time = time.time()
+    colorizer.set_image((image.astype('float32') / 255), size)
+    colorized_image = colorizer.colorize()
+    elapsed_time = time.time() - start_time
+    print(f'[+] [{rid}] Colorized image {[*image.shape]}->{[*colorized_image.shape]} in {elapsed_time:.2f} seconds.')
+    return colorized_image
+
+
+def upscale_image(rid, image, upscaler, factor):
+    start_time = time.time()
+    upscaled_image = upscaler.upscale((image.astype('float32') / 255), factor)
+    elapsed_time = time.time() - start_time
+    print(f'[+] [{rid}] Upscaled image (x{factor}) {[*image.shape]}->{[*upscaled_image.shape]} in {elapsed_time:.2f} seconds.')
+    return upscaled_image
+
+
+config = None
+colorizer = None
+upscaler = None
+denoiser = None
+
+def initialize_components():
+    global colorizer, upscaler, denoiser
+
+    colorizer = MangaColorizator(config) if config.colorize else None
+    upscaler = MangaUpscaler(config) if config.upscale else None
+    denoiser = MangaDenoiser(config) if config.denoise else None
+    print(f'[+] Components initialized')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Run Manga Colorizer server')
+    parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda', help='Device to use')
+    parser.add_argument('--port', type=int, default=5000, help='Port to run the server on')
+
+    parser.add_argument('--colorizer_path', default=None, help='Path to colorizer weights')
+    parser.add_argument('--colorizer_type', choices=['AlacGAN', 'CycleGAN'], default='AlacGAN',
+                        help='Which architecture: AlacGAN or CycleGAN')
+
+    parser.add_argument('--upscaler_path', default=None, help='Path to upscaler weights')
+    parser.add_argument('--upscaler_type', choices=['ESRGAN', 'GigaGAN'], default='ESRGAN',
+                        help='Which architecture: ESRGAN or GigaGAN')
+
+    parser.add_argument('--no-ssl', dest='ssl', action='store_false', default=True, help='Disable SSL context.')
+    parser.add_argument('--no-upscale', dest='upscale', action='store_false', default=True, help='Disable upscaling')
+    parser.add_argument('--no-colorize', dest='colorize', action='store_false', default=True,
+                        help='Disable colorization')
+    parser.add_argument('--no-denoise', dest='denoise', action='store_false', default=True, help='Disable denoiser')
+
+    parser.add_argument('--upscale_factor', choices=[2, 4], default=4, type=int, help='Upscale by x2 or x4')
+    parser.add_argument('--denoise_sigma', default=25, type=int, help='How much noise to expect from the image')
+    
+    # Performance optimization flags
+    parser.add_argument('--fp16', dest='use_fp16', action='store_true', default=False,
+                        help='Use FP16 (half precision) for faster inference on GPUs (1.5-2x speedup)')
+    parser.add_argument('--compile', dest='use_compile', action='store_true', default=False,
+                        help='Compile models with torch.compile() for faster inference (PyTorch 2.0+, 10-30%% speedup)')
+    parser.add_argument('--max-image-size', type=int, default=0,
+                        help='Maximum image dimension for processing (0 = no limit, smaller = faster)')
+    parser.add_argument('--cache-root', dest='cache_root', default='cache',
+                        help='Root directory for caching processed images')
+
+    config = parser.parse_args()
+
+    # Auto-detect GPU and adjust settings for memory efficiency
+    if config.device == 'cuda' and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0).lower()
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+        
+        # A100 GPU (40GB/80GB) - optimize for performance
+        if 'a100' in gpu_name:
+            print(f"[*] Detected A100 GPU ({gpu_memory:.1f}GB VRAM) - optimizing for maximum performance")
+        # T4 GPU (16GB) - optimize for memory efficiency
+        elif 't4' in gpu_name or (gpu_memory <= 16 and 'tesla' in gpu_name):
+            print(f"[*] Detected T4 GPU ({gpu_memory:.1f}GB VRAM) - optimizing for memory efficiency")
+            # Recommend FP16 for T4 (half memory usage)
+            if not config.use_fp16:
+                print("[*] T4 GPU detected: FP16 is highly recommended for memory efficiency")
+        else:
+            print(f"[*] Detected GPU: {torch.cuda.get_device_name(0)} ({gpu_memory:.1f}GB VRAM)")
+        
+        # Auto-adjust batch sizes based on VRAM and FP16
+        if gpu_memory <= 16:  # 16GB or less
+            recommended_batch = 2 if config.use_fp16 else 1
+        elif gpu_memory <= 24:  # 24GB
+            recommended_batch = 4 if config.use_fp16 else 2
+        elif gpu_memory <= 40:  # 40GB (A100)
+            recommended_batch = 16 if config.use_fp16 else 8
+        else:  # 80GB+ (A100 80GB)
+            recommended_batch = 32 if config.use_fp16 else 16
+
+    # Model Configuration
+    # 1. ESRGAN Settings
+    config.esrgan = ModelSettings()
+    # Auto-adjust tile size based on GPU VRAM
+    if config.device == 'cuda' and torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if gpu_memory >= 40:  # A100 - can process larger tiles or disable tiling
+            config.esrgan.tile_size = 0  # Disable tiling for A100 (process whole image)
+        elif gpu_memory >= 24:  # 24GB+ GPUs
+            config.esrgan.tile_size = 512
+        else:  # 16GB or less
+            config.esrgan.tile_size = 256
+    else:
+        config.esrgan.tile_size = 256
+    config.esrgan.tile_pad = 10
+
+    # 2. GigaGAN (AuraSR) Settings
+    config.gigagan = ModelSettings()
+    # Auto-adjust batch size based on GPU VRAM
+    if config.device == 'cuda' and torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if gpu_memory <= 16:
+            config.gigagan.batch_size = 2 if config.use_fp16 else 1
+        elif gpu_memory <= 24:
+            config.gigagan.batch_size = 4 if config.use_fp16 else 2
+        elif gpu_memory <= 40:  # A100 40GB
+            config.gigagan.batch_size = 16 if config.use_fp16 else 8
+        else:  # A100 80GB or larger
+            config.gigagan.batch_size = 32 if config.use_fp16 else 16
+    else:
+        config.gigagan.batch_size = 4  # Default
+    config.gigagan.use_overlap = False  # True = High Quality (Slow x2), False = Fast
+    if config.device == 'cuda' and torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    if config.use_fp16:
+        print(f"[*] GigaGAN batch size: {config.gigagan.batch_size} (optimized for FP16 + {gpu_memory:.1f}GB VRAM)")
+
+    # 3. AlacGAN Settings
+    config.alacgan = ModelSettings()
+    config.alacgan.tile_size = 0
+    config.alacgan.tile_pad = 0
+    config.alacgan.image_size = 576
+
+    # 4. CycleGAN Settings
+    config.cyclegan = ModelSettings()
+    config.cyclegan.tile_size = 0
+    config.cyclegan.tile_pad = 0
+    config.cyclegan.image_size = 512
+
+    resolve_paths(config)
+
+    initialize_components()
+
+    if config.ssl:
+        context = ('ssl/server.crt', 'ssl/server.key')
+        app.run(host='0.0.0.0', port=config.port, ssl_context=context)
+    else:
+        app.run(host='0.0.0.0', port=config.port, debug=False)
